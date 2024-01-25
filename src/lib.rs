@@ -1,7 +1,11 @@
 use std::fmt;
 
+mod buffer;
 #[cfg(feature = "serde")]
 pub mod serde;
+
+use buffer::Buffer;
+pub use buffer::DataType;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -22,45 +26,10 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DataType {
-    Null = 0,
-    True = 1,
-    False = 2,
-    /// JSON RFC-8259 integer literal.
-    Int = 3,
-    /// JSON5 integer literal.
-    Int5 = 4,
-    /// JSON RFC-8259 float literal.
-    Float = 5,
-    /// JSON5 float literal.
-    Float5 = 6,
-    /// String contents that can be used directly both in JSON and SQL.
-    Text = 7,
-    /// JSON RFC-8259 string contents.
-    TextJ = 8,
-    /// JSON5 string contents.
-    Text5 = 9,
-    /// Unescaped string contents.
-    TextRaw = 10,
-    Array = 11,
-    Object = 12,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeaderSize {
-    Embedded = 0,
-    U8 = 1,
-    U16 = 2,
-    U32 = 4,
-    U64 = 8,
-}
-
 /// A buffer representing a single JSONB value.
 #[derive(Debug)]
 pub struct JSONB<'d> {
-    data: &'d [u8],
+    buffer: Buffer<'d>,
 }
 
 /// A string encoded in any of the JSONB formats.
@@ -74,12 +43,12 @@ pub struct JSONBString<'d> {
 /// A JSONB array containing binary data.
 #[derive(Clone)]
 pub struct JSONBArray<'d> {
-    data: &'d [u8],
+    data: Buffer<'d>,
 }
 
 #[derive(Clone)]
 pub struct JSONBObject<'d> {
-    data: &'d [u8],
+    data: Buffer<'d>,
 }
 
 /// Iterator over a JSONB array.
@@ -123,12 +92,14 @@ impl From<DataType> for u8 {
         data_type as u8
     }
 }
+
 impl<'d> JSONBString<'d> {
     pub fn as_str(&self) -> Option<&'d str> {
         // TODO this should only be done for certain data types
         std::str::from_utf8(self.data).ok()
     }
 }
+
 impl<'d> fmt::Display for JSONBString<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Unescape
@@ -155,25 +126,18 @@ impl<'b> PartialEq<&str> for JSONBString<'b> {
 
 impl<'d> ArrayIter<'d> {
     fn new(array: JSONBArray<'d>) -> Self {
-        Self(JSONB { data: array.data })
+        Self(JSONB { buffer: array.data })
     }
 }
 
 impl<'d> Iterator for ArrayIter<'d> {
     type Item = JSONB<'d>;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.0.data.is_empty() {
+        if self.0.buffer.is_empty() {
             return None;
         }
-        match self.0.expected_size() {
-            Ok(size) => {
-                let element;
-                (element, self.0.data) = self.0.data.split_at(size);
-                Some(JSONB::new(element))
-            }
-            // TODO error handling
-            Err(_) => None,
-        }
+        let buffer = self.0.buffer.next().ok()?;
+        Some(JSONB { buffer })
     }
 }
 
@@ -239,68 +203,24 @@ impl<'d> IntoIterator for JSONBObject<'d> {
     }
 }
 
-impl From<HeaderSize> for usize {
-    fn from(size: HeaderSize) -> usize {
-        size as usize
-    }
-}
-fn header_size_from_byte(b: u8) -> Option<HeaderSize> {
-    match (b & 0xF0) >> 4 {
-        0..=11 => Some(HeaderSize::Embedded),
-        12 => Some(HeaderSize::U8),
-        13 => Some(HeaderSize::U16),
-        14 => Some(HeaderSize::U32),
-        15 => Some(HeaderSize::U64),
-        _ => None,
-    }
-}
-
 impl<'d> JSONB<'d> {
-    /// TODO should only have a checked conversion.
-    pub fn new(data: &'d [u8]) -> Self {
-        Self { data }
-    }
-
-    pub fn data_type(&self) -> Result<DataType> {
-        let b = *self.data.first().ok_or(Error::Eof)?;
-        DataType::try_from(b & 0x0F)
-    }
-
-    pub fn header_size(&self) -> Result<HeaderSize> {
-        let b = *self.data.first().ok_or(Error::Eof)?;
-        header_size_from_byte(b).ok_or(Error::InvalidSize)
-    }
-
-    /// TODO this panics when reading past end of data buffer
-    pub fn payload_size(&self) -> Result<usize> {
-        fn get_array<const N: usize>(slice: &[u8]) -> [u8; N] {
-            let mut array = [0; N];
-            array.copy_from_slice(slice);
-            array
-        }
-
-        let b = self.data.get(0).cloned().unwrap_or_default();
-        match (b & 0xF0) >> 4 {
-            n @ 0..=11 => Ok(usize::from(n)),
-            12 => Ok(usize::from(*self.data.get(1).ok_or(Error::Eof)?)),
-            13 => Ok(usize::from(u16::from_le_bytes(get_array(&self.data[1..3])))),
-            14 => Ok(usize::try_from(u32::from_le_bytes(get_array(&self.data[1..5]))).unwrap()),
-            15 => Ok(usize::try_from(u64::from_le_bytes(get_array(&self.data[1..9]))).unwrap()),
-            _ => Err(Error::InvalidSize),
+    /// Read the input as a single JSONB value. Returns Err if the payload size stored inside the
+    /// buffer does not match the length of the buffer.
+    pub fn new(input: &'d [u8]) -> Result<Self> {
+        let buffer = Buffer::new(input);
+        if buffer.len() == buffer.expected_size()? {
+            Ok(Self { buffer })
+        } else {
+            Err(Error::InvalidSize)
         }
     }
 
-    pub fn payload(&self) -> Result<&'d [u8]> {
-        let start = self.start_of_payload()?;
-        Ok(&self.data[start..])
+    fn data_type(&self) -> Result<DataType> {
+        self.buffer.data_type()
     }
 
-    pub fn start_of_payload(&self) -> Result<usize> {
-        Ok(1 + usize::from(self.header_size()?))
-    }
-
-    pub fn expected_size(&self) -> Result<usize> {
-        Ok(self.start_of_payload()? + self.payload_size()?)
+    fn payload(&self) -> Result<&'d [u8]> {
+        self.buffer.payload()
     }
 
     pub fn as_null(&self) -> Option<()> {
@@ -348,7 +268,7 @@ impl<'d> JSONB<'d> {
     pub fn as_array(&self) -> Option<JSONBArray<'d>> {
         match self.data_type() {
             Ok(DataType::Array) => Some(JSONBArray {
-                data: self.payload().ok()?,
+                data: Buffer::new(self.payload().ok()?),
             }),
             _ => None,
         }
@@ -357,7 +277,7 @@ impl<'d> JSONB<'d> {
     pub fn as_object(&self) -> Option<JSONBObject<'d>> {
         match self.data_type() {
             Ok(DataType::Object) => Some(JSONBObject {
-                data: self.payload().ok()?,
+                data: Buffer::new(self.payload().ok()?),
             }),
             _ => None,
         }
@@ -443,69 +363,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn data_type() -> Result<()> {
-        assert_eq!(JSONB::new(&[0]).data_type()?, DataType::Null);
-        assert_eq!(JSONB::new(&[1]).data_type()?, DataType::True);
-        assert_eq!(JSONB::new(&[2]).data_type()?, DataType::False);
-        assert_eq!(JSONB::new(&[0x13, 0x30]).data_type()?, DataType::Int);
-        assert_eq!(
-            JSONB::new(&[0x35, 0x30, 0x2e, 0x30]).data_type()?,
-            DataType::Float
-        );
-        assert_eq!(JSONB::new(&[0x07]).data_type()?, DataType::Text);
-        assert_eq!(JSONB::new(&[0x0b]).data_type()?, DataType::Array);
-        assert_eq!(JSONB::new(&[0x0c]).data_type()?, DataType::Object);
-        Ok(())
-    }
-
-    fn check_size(input: &[u8]) -> Result<()> {
-        assert_eq!(JSONB::new(input).expected_size()?, input.len());
-        Ok(())
-    }
-
-    #[test]
-    fn data_size() -> Result<()> {
-        check_size(&[0])?;
-        check_size(&[1])?;
-        check_size(&[2])?;
-        check_size(&[0x13, 0x30])?;
-        check_size(&[0x35, 0x30, 0x2e, 0x30])?;
-        check_size(&[0x07])?;
-        check_size(&[0x0b])?;
-        check_size(&[0x0c])?;
+    fn as_null() -> Result<()> {
+        assert_eq!(JSONB::new(&[0])?.as_null(), Some(()));
+        assert_eq!(JSONB::new(&[1])?.as_null(), None);
+        assert_eq!(JSONB::new(&[2])?.as_null(), None);
 
         Ok(())
     }
 
     #[test]
-    fn as_null() {
-        assert_eq!(JSONB::new(&[0]).as_null(), Some(()));
-        assert_eq!(JSONB::new(&[1]).as_null(), None);
-        assert_eq!(JSONB::new(&[2]).as_null(), None);
+    fn as_bool() -> Result<()> {
+        assert_eq!(JSONB::new(&[0])?.as_bool(), None);
+        assert_eq!(JSONB::new(&[1])?.as_bool(), Some(true));
+        assert_eq!(JSONB::new(&[2])?.as_bool(), Some(false));
+
+        Ok(())
     }
 
     #[test]
-    fn as_bool() {
-        assert_eq!(JSONB::new(&[0]).as_bool(), None);
-        assert_eq!(JSONB::new(&[1]).as_bool(), Some(true));
-        assert_eq!(JSONB::new(&[2]).as_bool(), Some(false));
-    }
-
-    #[test]
-    fn as_string() {
+    fn as_string() -> Result<()> {
         let Some(s) =
-            JSONB::new(&[0x87, 0x61, 0x20, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67]).as_string()
+            JSONB::new(&[0x87, 0x61, 0x20, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67])?.as_string()
         else {
             panic!("expected string");
         };
         assert_eq!(s.as_str(), Some("a string"));
+
+        Ok(())
     }
 
     #[test]
-    fn as_array() {
+    fn as_array() -> Result<()> {
         let Some(s) = JSONB::new(&[
             0xbb, 0x13, 0x31, 0x13, 0x32, 0x13, 0x33, 0x47, 0x66, 0x6f, 0x75, 0x72,
-        ])
+        ])?
         .as_array() else {
             panic!("expected array");
         };
@@ -519,16 +410,18 @@ mod tests {
             Some("four")
         );
         assert!(iter.next().is_none());
+
+        Ok(())
     }
 
     #[test]
-    fn as_object() {
+    fn as_object() -> Result<()> {
         let Some(s) = JSONB::new(&[
             0xcc, 0x30, 0x57, 0x70, 0x6c, 0x61, 0x69, 0x6e, 0x67, 0x6f, 0x62, 0x6a, 0x65, 0x63,
             0x74, 0x47, 0x77, 0x69, 0x74, 0x68, 0xcb, 0x0e, 0x47, 0x6b, 0x65, 0x79, 0x73, 0x17,
             0x26, 0x67, 0x76, 0x61, 0x6c, 0x75, 0x65, 0x73, 0x77, 0x6e, 0x65, 0x73, 0x74, 0x69,
             0x6e, 0x67, 0x5b, 0x13, 0x31, 0x13, 0x32, 0x0c,
-        ])
+        ])?
         .as_object() else {
             panic!("expected object");
         };
@@ -548,5 +441,7 @@ mod tests {
         assert!(value.as_array().is_some());
 
         assert!(iter.next().is_none());
+
+        Ok(())
     }
 }

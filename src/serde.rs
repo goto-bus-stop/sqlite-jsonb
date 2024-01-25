@@ -1,3 +1,4 @@
+use crate::buffer::Buffer;
 use crate::ArrayIter;
 use crate::DataType;
 use crate::Error;
@@ -23,15 +24,13 @@ impl serde::de::Error for Error {
 }
 
 pub struct Deserializer<'de> {
-    input: JSONB<'de>,
+    input: Buffer<'de>,
 }
 
 impl<'de> Deserializer<'de> {
     fn next(&mut self) -> Result<JSONB<'de>> {
-        let size = self.input.expected_size()?;
-        let (element, buffer) = self.input.data.split_at(size);
-        self.input = JSONB { data: buffer };
-        Ok(JSONB { data: element })
+        let element = self.input.next()?;
+        Ok(JSONB { buffer: element })
     }
 }
 
@@ -417,7 +416,9 @@ impl<'de> SeqAccess<'de> for ArrayDeserializer<'de> {
         match self.iter.next() {
             None => Ok(None),
             Some(element) => seed
-                .deserialize(&mut Deserializer { input: element })
+                .deserialize(&mut Deserializer {
+                    input: element.buffer,
+                })
                 .map(Some),
         }
     }
@@ -436,7 +437,9 @@ impl<'de> MapAccess<'de> for ObjectDeserializer<'de> {
         match self.iter.next() {
             None => Ok(None),
             Some(element) => seed
-                .deserialize(&mut Deserializer { input: element })
+                .deserialize(&mut Deserializer {
+                    input: element.buffer,
+                })
                 .map(Some),
         }
     }
@@ -448,7 +451,9 @@ impl<'de> MapAccess<'de> for ObjectDeserializer<'de> {
         let Some(element) = self.iter.next() else {
             return Err(Error::Eof);
         };
-        seed.deserialize(&mut Deserializer { input: element })
+        seed.deserialize(&mut Deserializer {
+            input: element.buffer,
+        })
     }
 }
 
@@ -457,10 +462,10 @@ where
     T: Deserialize<'a>,
 {
     let mut deserializer = Deserializer {
-        input: JSONB::new(s),
+        input: Buffer::new(s),
     };
     let t = T::deserialize(&mut deserializer)?;
-    if deserializer.input.data.is_empty() {
+    if deserializer.input.is_empty() {
         Ok(t)
     } else {
         Err(Error::Eof)
