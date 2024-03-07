@@ -120,12 +120,15 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
         V: Visitor<'de>,
     {
         let element = self.next()?;
-        visitor.visit_i128(element.as_int().and_then(|i| i.try_into().ok()).ok_or(
-            Error::WrongDataType {
-                actual: element.data_type().unwrap(),
-                expected: DataType::Int,
-            },
-        )?)
+        visitor.visit_i128(
+            element
+                .as_int()
+                .map(|i| i.into())
+                .ok_or(Error::WrongDataType {
+                    actual: element.data_type().unwrap(),
+                    expected: DataType::Int,
+                })?,
+        )
     }
 
     fn deserialize_u64<V>(self, visitor: V) -> Result<V::Value>
