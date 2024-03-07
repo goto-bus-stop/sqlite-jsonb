@@ -94,15 +94,20 @@ impl From<DataType> for u8 {
 }
 
 impl<'d> JSONBString<'d> {
+    /// Returns the contents as a UTF-8 str slice if the underlying data type allows it.
+    ///
+    /// If the underlying data type contains escape sequences, returns None.
     pub fn as_str(&self) -> Option<&'d str> {
-        // TODO this should only be done for certain data types
-        std::str::from_utf8(self.data).ok()
+        if matches!(self.ty, DataType::Text | DataType::TextRaw) {
+            std::str::from_utf8(self.data).ok()
+        } else {
+            None
+        }
     }
 }
 
 impl<'d> fmt::Display for JSONBString<'d> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Unescape
         if let Some(s) = self.as_str() {
             f.write_str(s)?;
         } else {
